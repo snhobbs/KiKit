@@ -56,7 +56,7 @@ class BaseAngle(pcbnew.EDA_ANGLE):
         return self.str
 
     def __repr__(self):
-        return f"<BaseAngle: {int(self)}, {self.str} >"
+        return f"<BaseAngle: {str(self)}, {self.str} >"
 
 
 class PercentageValue(float):
