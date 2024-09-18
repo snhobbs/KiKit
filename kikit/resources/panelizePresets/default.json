@@ -50,6 +50,13 @@
         "type": "none",
         "clearance": "0mm",
         "cutcurves": false,
+        "linewidth": "0.3mm",
+        "textthickness": "0.3mm",
+        "textsize": "2mm",
+        "endprolongation": "3mm",
+        "textprolongation": "3mm",
+        "textoffset": "3mm",
+        "template": "V-CUT",
         "layer": "Cmts.User",
         "offset": "0mm",
         "prolong": "0mm",
@@ -85,6 +92,7 @@
         "voffset": "0mm",
         "size": "2mm",
         "paste": false,
+        "soldermaskmargin": "0mm",
         "code": "none",
         "arg": ""
     },
@@ -164,8 +172,8 @@
         "edgeclearance": "0.5mm",
         "layers": "F.Cu,B.Cu",
         "width": "1mm",
-        "diameter": "5mm",
-        "spacing": "1mm",
+        "diameter": "7mm",
+        "spacing": "0.5mm",
         "orientation": "45deg",
         "threshold": "15%"
     },
@@ -179,7 +187,8 @@
         "scriptarg": "",
         "origin": "tl",
         "refillzones": false,
-        "dimensions": false
+        "dimensions": false,
+        "edgewidth": "0.1mm"
     },
     "page": {
         "type": "inherit",

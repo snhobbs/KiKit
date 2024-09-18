@@ -56,6 +56,8 @@ class Atom:
     def __eq__(self, o):
         if isinstance(o, str):
             return self.value == o
+        if not isinstance(o, Atom):
+            return False
         return self.value == o.value and self.leadingWhitespace == o.leadingWhitespace
 
 class SExpr:
@@ -83,6 +85,8 @@ class SExpr:
         return f"Expr([{', '.join(val)}], '{self.leadingWhitespace}', '{self.trailingWhitespace}')"
 
     def __eq__(self, o):
+        if not isinstance(o, SExpr):
+            return False
         return (self.items == o.items and
                 self.leadingWhitespace == o.leadingWhitespace and
                 self.trailingWhitespace == o.trailingWhitespace and
@@ -141,6 +145,18 @@ def readWhitespace(stream):
         c = stream.peek()
     return "".join(w)
 
+def readWhitespaceWithComments(stream):
+    w = []
+    c = stream.peek()
+    while c.isspace() or c == "#":
+        w.append(stream.read())
+        if c == "#":
+            while stream.peek() != "\n":
+                w.append(stream.read())
+            w.append(stream.read())
+        c = stream.peek()
+    return "".join(w)
+
 def readSexpr(stream, limit=None):
     """
     Reads SExpression from the stream. You can optionally try to parse only the
@@ -193,10 +209,10 @@ def parseSexprListF(sourceStream, limit=None):
     sexprs = []
     stream = Stream(sourceStream)
     while stream.peek() != "":
-        lw = readWhitespace(stream)
+        lw = readWhitespaceWithComments(stream)
         s = readSexpr(stream, limit=limit)
         s.leadingWhitespace = lw
-        s.trailingOuterWhitespace = readWhitespace(stream)
+        s.trailingOuterWhitespace = readWhitespaceWithComments(stream)
         sexprs.append(s)
     return sexprs
 

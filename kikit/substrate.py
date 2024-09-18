@@ -11,7 +11,7 @@ from pcbnewTransition import pcbnew
 from enum import IntEnum
 from itertools import product
 
-from typing import List, Tuple, Union
+from typing import Iterable, List, Tuple, Union
 
 from kikit.common import *
 from kikit.units import deg
@@ -30,10 +30,19 @@ class NoIntersectionError(RuntimeError):
         super().__init__(message)
         self.point = point
 
+class TabError(RuntimeError):
+    def __init__(self, origin, direction, hints):
+        self.origin = origin
+        self.direction = direction
+        message = "Cannot create tab; possible causes:\n"
+        for hint in hints:
+            message += f"- {hint}\n"
+        super().__init__(message)
+
 class TabFilletError(RuntimeError):
     pass
 
-def roundPoint(point, precision=-4):
+def roundPoint(point, precision=-2):
     return (round(point[0], precision), round(point[1], precision))
 
 def getStartPoint(geom):
@@ -54,7 +63,7 @@ def getEndPoint(geom):
         # Rectangle is closed, so it starts at the same point as it ends
         point = geom.GetStart()
     else:
-        point = geom.GetEnd()
+        point = geom.GetStart() if geom.IsClosed() else geom.GetEnd()
     return point
 
 class CoincidenceList(list):
@@ -93,7 +102,7 @@ def isValidPcbShape(g):
     with zero length. Unfortunately, KiCAD does not discard such lines when
     saving. Therefore, we have to check it.
     """
-    return g.GetShape() != pcbnew.S_SEGMENT or g.GetLength() > 0
+    return g.GetShape() != pcbnew.S_SEGMENT or g.GetLength() >= fromMm(0.001)
 
 def extractRings(geometryList):
     """
@@ -201,6 +210,8 @@ def approximateBezier(bezier, endWith):
                      3 * t ** 2 * (1 - t) * bc2 + \
                      t ** 3 * end
             outline.append(vertex)
+    else:
+        outline += [start, end]
     outline.append(end)
 
     endWith = np.array(endWith)
@@ -337,19 +348,161 @@ def substratesFrom(polygons):
         substrates.append(Polygon(polygon.exterior, holes))
     return substrates
 
-def commonCircle(a, b, c):
-    """
-    Given three 2D points return (x, y, r) of the circle they lie on or None if
-    they lie in a line
-    """
-    arc = pcbnew.PCB_SHAPE()
-    arc.SetShape(STROKE_T.S_ARC)
-    arc.SetArcGeometry(toKiCADPoint(a), toKiCADPoint(b), toKiCADPoint(c))
-    center = [int(x) for x in arc.GetCenter()]
-    mid = [(a[i] + b[i]) // 2 for i in range(2)]
-    if center == mid:
-        return None
-    return roundPoint(center, -8)
+class CircleFitCandidates:
+    def __init__(self, tolerance: int = fromMm(0.005), radius_limit: int = fromMm(1000)):
+        self.tolerance = tolerance
+        self.radius_limit = radius_limit
+
+        self._xs = []
+        self._xSum: float = 0
+        self._ys = []
+        self._ySum: float = 0
+
+        self.foundCircle: Optional[Tuple[np.array, float]] = None
+
+    def __len__(self) -> int:
+        return len(self._xs)
+
+    def addPoint(self, point: VECTOR2I) -> bool:
+        """
+        Try adding a candidate point. Returns true, if the point could lie on
+        already found a circle. If the point doesn't lie on an already found
+        circle, it is not added to the collection.
+        """
+        self._xs.append(point[0])
+        self._xSum += point[0]
+
+        self._ys.append(point[1])
+        self._ySum += point[1]
+
+        if len(self) < 5:
+            return True
+
+        newCenter, newRadius = self._fitCircle()
+
+        needsRevalidation = False
+        if self.foundCircle is None:
+            needsRevalidation = True
+        else:
+            c, r = self.foundCircle
+            needsRevalidation = np.linalg.norm(newCenter - c) > self.tolerance or np.abs(newRadius - r) > self.tolerance
+
+        if needsRevalidation:
+            points = [np.array([x, y]) for x, y in zip(self._xs, self._ys)]
+            toRevalidate = list(zip(points, points[1:]))
+        else:
+            toRevalidate = [(np.array([self._xs[-2], self._ys[-2]]), np.array([self._xs[-1], self._ys[-1]]))]
+
+        if self._doLinesFitCircle(toRevalidate, newCenter, newRadius) and newRadius < self.radius_limit:
+            self.foundCircle = newCenter, newRadius
+            return True
+
+        self._popLast()
+        return False
+
+    def _doLinesFitCircle(self, lines: Iterable[Tuple[np.array, np.array]],
+                          c: np.array, r: float) -> bool:
+        for start, end in lines:
+            # We don't use list of candidates in this as it is in the hot path
+            # and constructing the list of candidates adds a significant
+            # overhead (both technically, and for early return)
+            #
+            # The extreme occurs either in one of the endpoints or in the
+            # projection of center of the circle to the line (if it lies on the
+            # segment).
+            if np.abs(np.linalg.norm(start - c) - r) > self.tolerance:
+                return False
+            if np.abs(np.linalg.norm(end - c) - r) > self.tolerance:
+                return False
+
+            # Project center to the line; if it doesn't fit line, continue
+            ap = c - start
+            ab = end - start
+            t = np.dot(ap, ab) / np.dot(ab, ab)
+            if t < 0 or t > 1:
+                continue
+            projection = start + t * ab
+            if np.abs(np.linalg.norm(projection - c) - r) > self.tolerance:
+                return False
+        return True
+
+    @property
+    def start(self) -> np.array:
+        return np.array((self._xs[0], self._ys[0]))
+
+    @property
+    def end(self) -> np.array:
+        return np.array((self._xs[-1], self._ys[-1]))
+
+    @property
+    def mid(self) -> np.array:
+        idx = len(self) // 2
+        return np.array((self._xs[idx], self._ys[idx]))
+
+    def _popLast(self):
+        self._xSum -= self._xs[-1]
+        self._xs.pop()
+        self._ySum -= self._ys[-1]
+        self._ys.pop()
+
+    def _fitCircle(self, maxIter = 10) -> Tuple[np.array, float]:
+        """
+        Implements Kenichi Kanatani, Prasanna Rangarajan, "Hyper least squares fitting of circles and ellipses"
+        Computational Statistics & Data Analysis, Vol. 55, pages 2197-2208, (2011)
+
+        Implementation is based on https://github.com/AlliedToasters/circle-fit/blob/master/src/circle_fit/circle_fit.py
+
+        Returns center and radius of the circle fit.
+        """
+        n = len(self._xs)
+
+        xMean = self._xSum / n
+        yMean = self._ySum / n
+
+        Xi = np.array(self._xs) - xMean
+        Yi = np.array(self._ys) - yMean
+        Zi = Xi * Xi + Yi * Yi
+
+        # compute moments
+        Mxy = (Xi * Yi).sum() / n
+        Mxx = (Xi * Xi).sum() / n
+        Myy = (Yi * Yi).sum() / n
+        Mxz = (Xi * Zi).sum() / n
+        Myz = (Yi * Zi).sum() / n
+        Mzz = (Zi * Zi).sum() / n
+
+        # computing the coefficients of characteristic polynomial
+        Mz = Mxx + Myy
+        Cov_xy = Mxx * Myy - Mxy * Mxy
+        Var_z = Mzz - Mz * Mz
+
+        A2 = 4 * Cov_xy - 3 * Mz * Mz - Mzz
+        A1 = Var_z * Mz + 4. * Cov_xy * Mz - Mxz * Mxz - Myz * Myz
+        A0 = Mxz * (Mxz * Myy - Myz * Mxy) + Myz * (Myz * Mxx - Mxz * Mxy) - Var_z * Cov_xy
+        A22 = A2 + A2
+
+        # finding the root of the characteristic polynomial
+        Y = A0
+        X = 0.0
+        for i in range(maxIter):
+            Dy = A1 + X * (A22 + 16. * (X ** 2))
+            xnew = X - Y / Dy
+            if xnew == X or not np.isfinite(xnew):
+                break
+            ynew = A0 + xnew * (A1 + xnew * (A2 + 4. * xnew * xnew))
+            if abs(ynew) >= abs(Y):
+                break
+            X, Y = xnew, ynew
+
+        det = X ** 2 - X * Mz + Cov_xy
+        Xcenter = (Mxz * (Myy - X) - Myz * Mxy) / det / 2.
+        Ycenter = (Myz * (Mxx - X) - Mxz * Mxy) / det / 2.
+
+        xc: float = Xcenter + xMean
+        yc: float = Ycenter + yMean
+        r = np.sqrt(abs(Xcenter ** 2 + Ycenter ** 2 + Mz))
+        return np.array((xc, yc)), r
+
 
 
 def liesOnSegment(start, end, point, tolerance=fromMm(0.01)):
@@ -529,32 +682,74 @@ class Substrate:
         return items
 
     def _serializeRing(self, ring, reconstructArcs):
+        TOLERANCE = fromMm(0.01)
         coords = ring.coords
-        segments = []
         if coords[0] != coords[-1]:
             raise RuntimeError("Ring is incomplete")
+
+        # Always start with the longes semgent (so we do not start in the middle
+        # of an arc if possible)
+        coords = np.array(coords[:-1])  # Exclude the last point since it's a duplicate of the first
+        distances = np.sqrt(np.sum(np.diff(coords, axis=0, append=coords[:1,:])**2, axis=1))
+        max_dist_index = np.argmax(distances)
+        rearranged = np.roll(coords, -max_dist_index, axis=0)
+        coords = np.vstack((rearranged, rearranged[0]))
+
+        segments = []
         i = 0
         while i < len(coords):
             j = i # in the case the following cycle never happens
+            candidateCircle = CircleFitCandidates(tolerance=TOLERANCE)
             if reconstructArcs:
-                for j in range(i, len(coords) - 3): # Just walk until there is an arc
-                    cc1 = commonCircle(coords[j], coords[j + 1], coords[j + 2])
-                    cc2 = commonCircle(coords[j + 1], coords[j + 2], coords[j + 3])
-                    if cc1 is None or cc2 is None or cc1 != cc2:
+                for j in range(i, len(coords)):
+                    # Just walk edge segments until there is an arc
+                    if not candidateCircle.addPoint(coords[j]):
                         break
-            if j - i > 10:
-                j += 1
-                # Yield a circle
-                a = coords[i]
-                b = coords[(i + j) // 2]
-                c = coords[j]
-                segments.append(self._constructArc(a, b, c))
-                i = j
+
+            if candidateCircle.foundCircle is not None and candidateCircle.foundCircle[1] > fromMm(0.25):
+                center, radius = candidateCircle.foundCircle
+                start, end, mid = candidateCircle.start, candidateCircle.end, candidateCircle.mid
+
+                # We prefer to preserve arc start and end points, adjust center
+                # so it is true:
+                dir = end - start
+                chordLength = np.linalg.norm(dir)
+                if chordLength == 0:
+                    segments.append(self._constructCircle(center, radius))
+                else:
+                    dir /= chordLength
+                    normal = np.array([dir[1], -dir[0]])
+                    chordMidpoint = (start + end) / 2
+
+                    # Due to numerical errors, the height might be invalid, if
+                    # so, assume it is zero
+                    heightSquared = radius ** 2 - chordLength ** 2 / 4
+                    if heightSquared < 0:
+                        height = 0
+                    else:
+                        height = np.sqrt(heightSquared)
+
+                    centerCandidates = [chordMidpoint + normal * height, chordMidpoint - normal * height]
+                    center = min(centerCandidates, key=lambda c: np.linalg.norm(c - center))
+
+                    centerToMidpoint = chordMidpoint - center
+                    centerToMidpointLength = np.linalg.norm(centerToMidpoint)
+                    if centerToMidpointLength == 0:
+                        centerToMidpoint = normal
+                    else:
+                        centerToMidpoint /= np.linalg.norm(centerToMidpoint)
+                    middleCandidates = [center + centerToMidpoint * radius, center - centerToMidpoint * radius]
+                    arcMiddle = min(middleCandidates, key=lambda c: np.linalg.norm(c - mid))
+
+                    segments.append(self._constructArc(toKiCADPoint(start), toKiCADPoint(arcMiddle), toKiCADPoint(end)))
+
+                i += len(candidateCircle) - 1
             else:
                 # Yield a line
                 a = coords[i]
                 b = coords[(i + 1) % len(coords)]
-                segments.append(self._constructEdgeSegment(a, b))
+                if np.linalg.norm(np.array(a) - np.array(b)) > SHP_EPSILON:
+                    segments.append(self._constructEdgeSegment(a, b))
                 i += 1
         return segments
 
@@ -575,6 +770,17 @@ class Substrate:
         arc.SetLayer(Layer.Edge_Cuts)
         arc.SetArcGeometry(toKiCADPoint(a), toKiCADPoint(b), toKiCADPoint(c))
         return arc
+
+    def _constructCircle(self, c, r):
+        circle = pcbnew.PCB_SHAPE()
+        circle.SetShape(STROKE_T.S_CIRCLE)
+        circle.SetLayer(Layer.Edge_Cuts)
+        circle.SetCenter(toKiCADPoint(c))
+        if isV8():
+            circle.SetRadius(int(r))
+        else:
+            circle.SetEnd(toKiCADPoint(c + np.array([r, 0])))
+        return circle
 
     def boundingBox(self):
         """
@@ -628,10 +834,14 @@ class Substrate:
         """
         self.orient()
 
-        origin = np.array(origin)
+        if self.substrates.contains(Point(origin)) and not self.substrates.boundary.contains(Point(origin)):
+            raise TabError(origin, direction, ["Tab annotation is placed inside the board. It has to be on edge or outside the board."])
+
+        origin = np.array(origin, dtype=np.float64)
+        direction = np.around(normalize(direction), 4)
+        origin -= direction * float(SHP_EPSILON)
         for geom in listGeometries(self.substrates):
             try:
-                direction = np.around(normalize(direction), 4)
                 sideOriginA = origin + makePerpendicular(direction) * width / 2
                 sideOriginB = origin - makePerpendicular(direction) * width / 2
                 boundary = geom.exterior
@@ -650,9 +860,9 @@ class Substrate:
                 direction = -direction
                 for p in listGeometries(partitionLine):
                     try:
-                        partitionSplitPointA = closestIntersectionPoint(splitPointA.coords[0],
+                        partitionSplitPointA = closestIntersectionPoint(splitPointA.coords[0] - direction * float(SHP_EPSILON),
                                 direction, p, maxHeight)
-                        partitionSplitPointB = closestIntersectionPoint(splitPointB.coords[0],
+                        partitionSplitPointB = closestIntersectionPoint(splitPointB.coords[0] - direction * float(SHP_EPSILON),
                                 direction, p, maxHeight)
                     except NoIntersectionError: # We cannot span towards the partition line
                         continue
@@ -672,26 +882,21 @@ class Substrate:
                         # penetrate the board substrate. Otherwise, there is a
                         # numerical instability on small slopes that yields
                         # artifacts on substrate union
-                        offsetTabFace = [(p[0] - SHP_EPSILON * direction[0], p[1] - SHP_EPSILON * direction[1]) for p in tabFace.coords]
+                        offsetTabFace = [(p[0] - float(SHP_EPSILON) * direction[0], p[1] - float(SHP_EPSILON) * direction[1]) for p in tabFace.coords]
+                        partitionFaceCoord = [(p[0] + float(SHP_EPSILON) * direction[0], p[1] + float(SHP_EPSILON) * direction[1]) for p in partitionFaceCoord]
                         tab = Polygon(offsetTabFace + partitionFaceCoord)
                         return self._makeTabFillet(tab, tabFace, fillet)
                 return None, None
             except NoIntersectionError as e:
                 continue
             except TabFilletError as e:
-                message = f"Cannot create fillet for tab: {e}\n"
-                message += f"  Annotation position {self._strPosition(origin)}\n"
-                message += "This is a bug. Please open an issue and provide the board on which the fillet failed."
-                raise RuntimeError(message) from None
+                raise TabError(origin, direction, ["This is a bug. Please open an issue and provide the board on which the fillet failed."])
 
-        message = "Cannot create tab:\n"
-        message += f"  Annotation position {self._strPosition(origin)}\n"
-        message += f"  Tab ray origin that failed: {self._strPosition(origin)}\n"
-        message += "Possible causes:\n"
-        message += "- too wide tab so it does not hit the board,\n"
-        message += "- annotation is placed inside the board,\n"
-        message += "- ray length is not sufficient,\n"
-        raise RuntimeError(message) from None
+        raise TabError(origin, direction, [
+            "too wide tab so it does not hit the board",
+            "annotation is placed inside the board",
+            "ray length is not sufficient"
+        ])
 
     def _makeTabFillet(self, tab: Polygon, tabFace: LineString, fillet: KiLength) \
             -> Tuple[Polygon, LineString]:
@@ -738,7 +943,7 @@ class Substrate:
         Add fillets to inner corners which will be produced by a mill with
         given radius.
         """
-        EPS = fromMm(0.01)
+        EPS = 1000 # This number is intentionally near KiCAD's resolution of 1nm to not enclose narrow slots, but to preserve radius
         RES = 32
         if millRadius < EPS:
             return

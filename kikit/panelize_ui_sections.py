@@ -183,16 +183,19 @@ class SVJustify(SChoiceBase):
 class SLayer(SChoiceBase):
     def __init__(self, *args, **kwargs):
         super().__init__(
-            [str(item).replace("Layer.", "").replace("_", ".")
+            [item.name.replace("Layer.", "").replace("_", ".")
                 for item in Layer], *args, **kwargs)
 
     def validate(self, s):
-        if isinstance(s, int):
-            if s in tuple(item.value for item in Layer):
-                return Layer(s)
+        if isinstance(s, int) or s.isdigit():
+            if int(s) in tuple(item.value for item in Layer):
+                return Layer(int(s))
             raise PresetError(f"{s} is not a valid layer number")
         if isinstance(s, str):
-            return Layer[s.replace(".", "_")]
+            try:
+                return Layer[s.replace(".", "_")]
+            except Exception:
+                pass
         raise PresetError(f"Got {s}, expected layer name or number")
 
 class SList(SectionBase):
@@ -210,12 +213,15 @@ class SLayerList(SList):
         return [self.readLayer(x) for x in super().validate(x)]
 
     def readLayer(self, s: str) -> Layer:
-        if isinstance(s, int):
-            if s in tuple(item.value for item in Layer):
-                return Layer(s)
+        if isinstance(s, int) or s.isdigit():
+            if int(s) in tuple(item.value for item in Layer):
+                return Layer(int(s))
             raise PresetError(f"{s} is not a valid layer number")
         if isinstance(s, str):
-            return Layer[s.replace(".", "_")]
+            try:
+                return Layer[s.replace(".", "_")]
+            except Exception:
+                pass
         raise PresetError(f"Got {s}, expected layer name or number")
 
 class SFootprintList(SList):
@@ -383,10 +389,10 @@ TABS_SECTION = {
         typeIn(["fixed", "plugin"]),
         "Number of tabs in a given direction."),
     "cutout": SLength(
-        typeIn(["fixed", "plugin"]),
+        typeIn(["fixed", "full", "plugin"]),
         "Depth of cutouts into the frame"),
     "patchcorners": SBool(
-        typeIn(["fixed", "plugin"]),
+        typeIn(["fixed", "full", "plugin"]),
         "Choose if to apply corner patches for the full tabs"
     ),
     "tabfootprints": SFootprintList(
@@ -433,6 +439,27 @@ CUTS_SECTION = {
     "cutcurves": SBool(
         typeIn(["vcuts", "plugin"]),
         "Approximate curves with straight cut"),
+    "linewidth": SLength(
+        typeIn(["vcuts", "layer", "plugin"]),
+        "Line width to plot cuts with"),
+    "textthickness": SLength(
+        typeIn(["vcuts", "plugin"]),
+        "Text thickness for width"),
+    "textsize": SLength(
+        typeIn(["vcuts", "plugin"]),
+        "Text size for vcuts"),
+    "endprolongation": SLength(
+        typeIn(["vcuts", "plugin"]),
+        "Prolongation on the end of V-CUT without text"),
+    "textprolongation": SLength(
+        typeIn(["vcuts", "plugin"]),
+        "Prolongation of the text size of V-CUT"),
+    "textoffset": SLength(
+        typeIn(["vcuts", "plugin"]),
+        "Text offset from the V-CUT"),
+    "template": SStr(
+        typeIn(["vcuts", "plugin"]),
+        "Text template for the V-CUT"),
     "layer": SLayer(
         typeIn(["vcuts", "layer", "plugin"]),
         "Specify layer for the drawings"),
@@ -534,6 +561,9 @@ TOOLING_SECTION = {
     "paste": SBool(
         typeIn(["3hole", "4hole", "plugin"]),
         "Include holes on the paste layer"),
+    "soldermaskmargin": SLength(
+        typeIn(["3hole", "4hole", "plugin"]),
+        "Solder mask expansion/margin"),
     "code": SPlugin(
         plugin.ToolingPlugin,
         typeIn(["plugin"]),
@@ -698,6 +728,10 @@ POST_SECTION = {
     "dimensions": SBool(
         always(),
         "Add dimensions markings to the finished panel"
+    ),
+    "edgewidth": SLength(
+        always(),
+        "Specify line width for the Edge.Cuts of the panel"
     )
 }
 

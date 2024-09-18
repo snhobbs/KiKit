@@ -1,5 +1,6 @@
 from copy import deepcopy
 import itertools
+import textwrap
 from pcbnewTransition import pcbnew, isV6
 from kikit import sexpr
 from kikit.common import normalize
@@ -22,17 +23,18 @@ import json
 import re
 import fnmatch
 from collections import OrderedDict
+from dataclasses import dataclass
 
 from kikit import substrate
 from kikit import units
 from kikit.kicadUtil import getPageDimensionsFromAst
-from kikit.substrate import Substrate, linestringToKicad, extractRings
+from kikit.substrate import Substrate, linestringToKicad, extractRings, TabError
 from kikit.defs import PAPER_DIMENSIONS, STROKE_T, Layer, EDA_TEXT_HJUSTIFY_T, EDA_TEXT_VJUSTIFY_T, PAPER_SIZES
 from kikit.common import *
 from kikit.sexpr import isElement, parseSexprF, SExpr, Atom, findNode, parseSexprListF
 from kikit.annotations import AnnotationReader, TabAnnotation
 from kikit.drc import DrcExclusion, readBoardDrcExclusions, serializeExclusion
-from kikit.units import mm, deg
+from kikit.units import mm, deg, inch
 from kikit.pcbnew_utils import increaseZonePriorities
 
 class PanelError(RuntimeError):
@@ -40,6 +42,17 @@ class PanelError(RuntimeError):
 
 class TooLargeError(PanelError):
     pass
+
+class NonFatalErrors(PanelError):
+    def __init__(self, errors: List[Tuple[KiPoint, str]]) -> None:
+        multiple = len(errors) > 1
+
+        message = f"There {'are' if multiple else 'is'} {len(errors)} error{'s' if multiple else ''} in the panel. The panel with error markers was saved for inspection.\n\n"
+        message += "The following errors occurred:\n"
+        for pos, err in errors:
+            message += f"- Location [{toMm(pos[0])}, {toMm(pos[1])}]\n"
+            message += textwrap.indent(err, "  ")
+        super().__init__(message)
 
 def identity(x):
     return x
@@ -56,11 +69,11 @@ class GridPlacerBase:
         """
         raise NotImplementedError("GridPlacerBase.position has to be overridden")
 
-    def rotation(self, i: int, j: int) -> int:
+    def rotation(self, i: int, j: int) -> KiAngle:
         """
         Given row and col coords of a board, return the orientation of the board
         """
-        return 0
+        return EDA_ANGLE(0, pcbnew.DEGREES_T)
 
 class BasicGridPosition(GridPlacerBase):
     """
@@ -93,8 +106,6 @@ class BasicGridPosition(GridPlacerBase):
                hbonecount * (self.hbonewidth + self.verSpace)
         return toKiCADPoint((xPos, yPos))
 
-    def rotation(self, i: int, j: int) -> KiAngle:
-        return EDA_ANGLE(0, pcbnew.DEGREES_T)
 
 class OddEvenRowsPosition(BasicGridPosition):
     """
@@ -120,7 +131,7 @@ class OddEvenRowsColumnsPosition(BasicGridPosition):
     """
     def rotation(self, i: int, j: int) -> KiAngle:
         if (i % 2) == (j % 2):
-            return 0
+            return EDA_ANGLE(0, pcbnew.DEGREES_T)
         return EDA_ANGLE(180, pcbnew.DEGREES_T)
 
 
@@ -368,7 +379,7 @@ def polygonToZone(polygon, board):
         zone.Outline().AddHole(linestringToKicad(boundary))
     return zone
 
-def buildTabs(substrate: Substrate,
+def buildTabs(panel: "Panel", substrate: Substrate,
               partitionLines: Union[GeometryCollection, LineString],
               tabAnnotations: Iterable[TabAnnotation], fillet: KiLength = 0) -> \
                 Tuple[List[Polygon], List[LineString]]:
@@ -381,11 +392,17 @@ def buildTabs(substrate: Substrate,
     """
     tabs, cuts = [], []
     for annotation in tabAnnotations:
-        t, c = substrate.tab(annotation.origin, annotation.direction,
-            annotation.width, partitionLines, annotation.maxLength, fillet)
-        if t is not None:
-            tabs.append(t)
-            cuts.append(c)
+        try:
+            t, c = substrate.tab(annotation.origin, annotation.direction,
+                annotation.width, partitionLines, annotation.maxLength, fillet)
+            if t is not None:
+                tabs.append(t)
+                cuts.append(c)
+        except TabError as e:
+            panel._renderLines(
+                [constructArrow(annotation.origin, annotation.direction, fromMm(3), fromMm(1))],
+                Layer.Margin)
+            panel.reportError(toKiCADPoint(e.origin), str(e))
     return tabs, cuts
 
 def normalizePartitionLineOrientation(line):
@@ -433,7 +450,23 @@ def bakeTextVars(board: pcbnew.BOARD) -> None:
     for drawing in board.GetDrawings():
         if not isinstance(drawing, pcbnew.PCB_TEXT):
             continue
-        drawing.SetText(drawing.GetShownText())
+        if isV8():
+            drawing.SetText(drawing.GetShownText(True))
+        else:
+            drawing.SetText(drawing.GetShownText())
+
+@dataclass
+class VCutSettings:
+    lineWidth: KiLength = fromMm(0.4)
+    textThickness: KiLength = fromMm(0.4)
+    textSize: KiLength = fromMm(2)
+    endProlongation: KiLength = fromMm(3)
+    textProlongation: KiLength = fromMm(3)
+    layer: Layer = Layer.Cmts_User
+    textTemplate: str = "V-CUT {pos_mm}"
+    textOffset: KiLength = fromMm(3)
+    clearance: KiLength = 0
+
 
 class Panel:
     """
@@ -452,6 +485,8 @@ class Panel:
         when boards are always associated with a project, you have to pass a
         name of the resulting file.
         """
+        self.errors: List[Tuple[KiPoint, str]] = []
+
         self.filename = panelFilename
         self.board = pcbnew.NewBoard(panelFilename)
         self.sourcePaths = set() # A set of all board files that were appended to the panel
@@ -461,8 +496,7 @@ class Panel:
         self.backboneLines = []
         self.hVCuts = set() # Keep V-cuts as numbers and append them just before saving
         self.vVCuts = set() # to make them truly span the whole panel
-        self.vCutLayer = Layer.Cmts_User
-        self.vCutClearance = 0
+        self.vCutSettings = VCutSettings()
         self.copperLayerCount = None
         self.renderedMousebiteCounter = 0
         self.zonesToRefill = pcbnew.ZONES()
@@ -486,13 +520,41 @@ class Panel:
         self.chamferWidth: Optional[KiLength] = None
         self.chamferHeight: Optional[KiLength] = None
 
-    def save(self, reconstructArcs: bool=False, refillAllZones: bool=False):
+    def reportError(self, position: KiPoint, message: str) -> None:
+        """
+        Reports a non-fatal error. The error is marked and rendered to the panel
+        """
+        footprint = pcbnew.FootprintLoad(KIKIT_LIB, "Error")
+        footprint.SetPosition(position)
+        for x in footprint.GraphicalItems():
+            if not isinstance(x, pcbnew.PCB_TEXTBOX):
+                continue
+            text = x.GetText()
+            if text == "MESSAGE":
+                x.SetText(message)
+        self.board.Add(footprint)
+
+        self.errors.append((position, message))
+
+    def hasErrors(self) -> bool:
+        """
+        Report if panel has any non-fatal errors presents
+        """
+        return len(self.errors) > 0
+
+    def save(self, reconstructArcs: bool=False, refillAllZones: bool=False,
+             edgeWidth: KiLength=fromMm(0.1)):
         """
         Saves the panel to a file and makes the requested changes to the prl and
         pro files.
         """
         panelEdges = self.boardSubstrate.serialize(reconstructArcs)
         boardsEdges = self._getRefillEdges(reconstructArcs)
+
+        for e in panelEdges:
+            e.SetWidth(edgeWidth)
+        for e in boardsEdges:
+            e.SetWidth(edgeWidth)
 
         vcuts = self._renderVCutH() + self._renderVCutV()
         keepouts = []
@@ -542,7 +604,7 @@ class Panel:
             fillBoard.Remove(edge)
         for edge in panelEdges:
             fillBoard.Add(edge)
-        if self.vCutLayer == Layer.Edge_Cuts:
+        if self.vCutSettings.layer == Layer.Edge_Cuts:
             vcuts = self._renderVCutH() + self._renderVCutV()
             for cut, _ in vcuts:
                 fillBoard.Add(cut)
@@ -615,7 +677,7 @@ class Panel:
             pass
 
     def writeCustomDrcRules(self):
-        with open(self.getDruFilepath(), "w", encoding="utf-8") as f:
+        with open(self.getDruFilepath(), "w+", encoding="utf-8") as f:
             f.write("(version 1)\n\n")
             for r in self.customDRCRules:
                 f.write(str(r))
@@ -1003,10 +1065,11 @@ class Panel:
             # the attribute must be first removed without changing the
             # orientation of the text.
             for item in (*footprint.GraphicalItems(), footprint.Value(), footprint.Reference()):
-                if isinstance(item, pcbnew.FP_TEXT) and item.IsKeepUpright():
+                if isinstance(item, pcbnew.FIELD_TYPE) and item.IsKeepUpright():
                     actualOrientation = item.GetDrawRotation()
                     item.SetKeepUpright(False)
-                    item.SetTextAngle(actualOrientation - footprint.GetOrientation())
+                    alteredOrientation = item.GetDrawRotation()
+                    item.SetTextAngle(item.GetTextAngle() + (alteredOrientation - actualOrientation))
             footprint.Rotate(originPoint, rotationAngle)
             footprint.Move(translation)
             edges += removeCutsFromFootprint(footprint)
@@ -1120,53 +1183,47 @@ class Panel:
         """
         self.vVCuts.add(pos)
 
-    def setVCutLayer(self, layer):
-        """
-        Set layer on which the V-Cuts will be rendered
-        """
-        self.vCutLayer = layer
-
-    def setVCutClearance(self, clearance):
-        """
-        Set V-cut clearance
-        """
-        self.vCutClearance = clearance
-
-    def _setVCutSegmentStyle(self, segment, layer):
+    def _setVCutSegmentStyle(self, segment):
         segment.SetShape(STROKE_T.S_SEGMENT)
-        segment.SetLayer(layer)
-        segment.SetWidth(int(0.4 * mm))
+        segment.SetLayer(self.vCutSettings.layer)
+        segment.SetWidth(self.vCutSettings.lineWidth)
 
-    def _setVCutLabelStyle(self, label, layer):
-        label.SetText("V-CUT")
-        label.SetLayer(layer)
-        label.SetTextThickness(int(0.4 * mm))
-        label.SetTextSize(toKiCADPoint((2 * mm, 2 * mm)))
+    def _setVCutLabelStyle(self, label, origin, position):
+        variables = {
+            "pos_mm": f"{(position - origin) / mm:.2f} mm",
+            "pos_inv_mm": f"{(origin - position) / mm:.2f} mm",
+            "pos_inch": f"{(position - origin) / inch:.3f} mm",
+            "pos_inv_inch": f"{(origin - position) / inch:.3f} mm",
+        }
+        label.SetText(self.vCutSettings.textTemplate.format(**variables))
+        label.SetLayer(self.vCutSettings.layer)
+        label.SetTextThickness(self.vCutSettings.textThickness)
+        label.SetTextSize(toKiCADPoint((self.vCutSettings.textSize, self.vCutSettings.textSize)))
         label.SetHorizJustify(EDA_TEXT_HJUSTIFY_T.GR_TEXT_HJUSTIFY_LEFT)
 
     def _renderVCutV(self):
         """ return list of PCB_SHAPE V-Cuts """
         bBox = self.boardSubstrate.boundingBox()
-        minY, maxY = bBox.GetY() - fromMm(3), bBox.GetY() + bBox.GetHeight() + fromMm(3)
+        minY, maxY = bBox.GetY() - self.vCutSettings.textProlongation, bBox.GetY() + bBox.GetHeight() + self.vCutSettings.endProlongation
         segments = []
         for cut in self.vVCuts:
             segment = pcbnew.PCB_SHAPE()
-            self._setVCutSegmentStyle(segment, self.vCutLayer)
+            self._setVCutSegmentStyle(segment)
             segment.SetStart(toKiCADPoint((cut, minY)))
             segment.SetEnd(toKiCADPoint((cut, maxY)))
 
             keepout = None
-            if self.vCutClearance != 0:
+            if self.vCutSettings.clearance != 0:
                 keepout = shapely.geometry.box(
-                    cut - self.vCutClearance / 2,
+                    cut - self.vCutSettings.clearance / 2,
                     bBox.GetY(),
-                    cut + self.vCutClearance / 2,
+                    cut + self.vCutSettings.clearance / 2,
                     bBox.GetY() + bBox.GetHeight())
             segments.append((segment, keepout))
 
             label = pcbnew.PCB_TEXT(segment)
-            self._setVCutLabelStyle(label, self.vCutLayer)
-            label.SetPosition(toKiCADPoint((cut, minY - fromMm(3))))
+            self._setVCutLabelStyle(label, self.getAuxiliaryOrigin()[0], cut)
+            label.SetPosition(toKiCADPoint((cut, minY - self.vCutSettings.textOffset)))
             label.SetTextAngle(fromDegrees(90))
             segments.append((label, None))
         return segments
@@ -1174,27 +1231,27 @@ class Panel:
     def _renderVCutH(self):
         """ return list of PCB_SHAPE V-Cuts """
         bBox = self.boardSubstrate.boundingBox()
-        minX, maxX = bBox.GetX() - fromMm(3), bBox.GetX() + bBox.GetWidth() + fromMm(3)
+        minX, maxX = bBox.GetX() - self.vCutSettings.endProlongation, bBox.GetX() + bBox.GetWidth() + self.vCutSettings.textProlongation
         segments = []
         for cut in self.hVCuts:
             segment = pcbnew.PCB_SHAPE()
-            self._setVCutSegmentStyle(segment, self.vCutLayer)
+            self._setVCutSegmentStyle(segment)
             segment.SetStart(toKiCADPoint((minX, cut)))
             segment.SetEnd(toKiCADPoint((maxX, cut)))
 
             keepout = None
-            if self.vCutClearance != 0:
+            if self.vCutSettings.clearance != 0:
                 keepout = shapely.geometry.box(
                     bBox.GetX(),
-                    cut - self.vCutClearance / 2,
+                    cut - self.vCutSettings.clearance / 2,
                     bBox.GetX() + bBox.GetWidth(),
-                    cut + self.vCutClearance / 2)
+                    cut + self.vCutSettings.clearance / 2)
             segments.append((segment, keepout))
 
 
             label = pcbnew.PCB_TEXT(segment)
-            self._setVCutLabelStyle(label, self.vCutLayer)
-            label.SetPosition(toKiCADPoint((maxX + fromMm(3), cut)))
+            self._setVCutLabelStyle(label, self.getAuxiliaryOrigin()[1], cut)
+            label.SetPosition(toKiCADPoint((maxX + self.vCutSettings.textOffset, cut)))
             segments.append((label, None))
         return segments
 
@@ -1304,9 +1361,9 @@ class Panel:
 
         minHeight - if the panel doesn't meet this height, it is extended
 
-        maxWidth - if the panel doesn't meet this width, TooLargeError is raised
+        maxWidth - if the panel doesn't meet this width, error is set and marked
 
-        maxHeight - if the panel doesn't meet this height, TooLargeHeight is raised
+        maxHeight - if the panel doesn't meet this height, error is set and marked
         """
         frameInnerRect = expandRect(shpBoxToRect(self.boardsBBox()), hspace, vspace)
         frameOuterRect = expandRect(frameInnerRect, width)
@@ -1317,7 +1374,8 @@ class Panel:
         if maxHeight is not None and frameOuterRect.GetHeight() > maxHeight:
             sizeErrors.append(f"Panel height {frameOuterRect.GetHeight() / units.mm} mm exceeds the limit {maxHeight / units.mm} mm")
         if len(sizeErrors) > 0:
-            raise TooLargeError(f"Panel doesn't meet size constraints:\n" + "\n".join(f"- {x}" for x in sizeErrors))
+            self.reportError(toKiCADPoint(frameOuterRect.GetEnd()),
+                             "Panel doesn't meet size constraints:\n" + "\n".join(f"- {x}" for x in sizeErrors))
 
         if frameOuterRect.GetWidth() < minWidth:
             diff = minWidth - frameOuterRect.GetWidth()
@@ -1361,15 +1419,15 @@ class Panel:
 
         minHeight - if the panel doesn't meet this height, it is extended
 
-        maxWidth - if the panel doesn't meet this width, TooLargeError is raised
+        maxWidth - if the panel doesn't meet this width, error is set
 
-        maxHeight - if the panel doesn't meet this height, TooLargeHeight is raised
+        maxHeight - if the panel doesn't meet this height, error is set
         """
         self.makeFrame(width, hspace, vspace, minWidth, minHeight, maxWidth, maxHeight)
         boardSlot = GeometryCollection()
         for s in self.substrates:
             boardSlot = boardSlot.union(s.exterior())
-        boardSlot = boardSlot.buffer(slotwidth)
+        boardSlot = boardSlot.buffer(slotwidth, join_style="mitre")
         frameBody = box(*self.boardSubstrate.bounds()).difference(boardSlot)
         self.appendSubstrate(frameBody)
 
@@ -1378,12 +1436,12 @@ class Panel:
         """
         Adds a rail to top and bottom. You can specify minimal height the panel
         has to feature. You can also specify maximal height of the panel. If the
-        height would be exceeded, TooLargeError is raised.
+        height would be exceeded, error is set.
         """
         minx, miny, maxx, maxy = self.panelBBox()
         height = maxy - miny + 2 * thickness
         if maxHeight is not None and height > maxHeight:
-            raise TooLargeError(f"Panel height {height / units.mm} mm exceeds the limit {maxHeight / units.mm} mm")
+            self.reportError(toKiCADPoint((maxx, maxy)), f"Panel height {height / units.mm} mm exceeds the limit {maxHeight / units.mm} mm")
         if height < minHeight:
             thickness = (minHeight - maxy + miny) // 2
         topRail = box(minx, maxy, maxx, maxy + thickness)
@@ -1400,7 +1458,7 @@ class Panel:
         minx, miny, maxx, maxy = self.panelBBox()
         width = maxx - minx + 2 * thickness
         if maxWidth is not None and width > maxWidth:
-            raise TooLargeError(f"Panel width {width / units.mm} mm exceeds the limit {maxWidth / units.mm} mm")
+            self.reportError(toKiCADPoint((maxx, maxy)), f"Panel width {width / units.mm} mm exceeds the limit {maxWidth / units.mm} mm")
         if width < minWidth:
             thickness = (minWidth - maxx + minx) // 2
         leftRail = box(minx - thickness, miny, minx, maxy)
@@ -1440,11 +1498,18 @@ class Panel:
         """
         Take a list of lines to cut and performs V-CUTS. When boundCurves is
         set, approximate curved cuts by a line from the first and last point.
-        Otherwise, raise an exception.
+        Otherwise, make an approximate cut and report error.
         """
         for cut in cuts:
             if len(cut.simplify(SHP_EPSILON).coords) > 2 and not boundCurves:
-                raise RuntimeError("Cannot V-Cut a curve")
+                message = "Cannot V-Cut a curve or a line that is either not horizontal or vertical.\n"
+                message += "Possible cause might be:\n"
+                message += "- your tabs hit a curved boundary of your PCB,\n"
+                message += "- your vertical or horizontal PCB edges are not precisely vertical or horizontal.\n"
+                message += "Modify the design or accept curve approximation via V-cuts."
+                self._renderLines([cut], Layer.Margin)
+                self.reportError(toKiCADPoint(cut[0]), message)
+                continue
             cut = cut.simplify(1).parallel_offset(offset, "left")
             start = roundPoint(cut.coords[0])
             end = roundPoint(cut.coords[-1])
@@ -1453,7 +1518,15 @@ class Panel:
             elif start.y == end.y or (abs(start.y - end.y) <= fromMm(0.5) and boundCurves):
                 self.addVCutH((start.y + end.y) / 2)
             else:
-                raise RuntimeError("Cannot perform V-Cut which is not horizontal or vertical")
+                description = f"[{toMm(start.x)}, {toMm(start.y)}] -> [{toMm(end.x)}, {toMm(end.y)}]"
+                message = f"Cannot perform V-Cut which is not horizontal or vertical ({description}).\n"
+                message += "Possible cause might be:\n"
+                message += "- check that intended edges are truly horizonal or vertical\n"
+                message += "- check your tab placement if it as expected\n"
+                message += "You can use layer style of cuts to see them and validate them."
+                self._renderLines([cut], Layer.Margin)
+                self.reportError(toKiCADPoint(cut[0]), message)
+                continue
 
     def makeMouseBites(self, cuts, diameter, spacing, offset=fromMm(0.25),
         prolongation=fromMm(0.5)):
@@ -1480,9 +1553,10 @@ class Panel:
                     hole = cut.interpolate( i * length / (count - 1) )
                 if bloatedSubstrate.intersects(hole):
                     self.addNPTHole(toKiCADPoint((hole.x, hole.y)), diameter,
-                                    ref=f"KiKit_MB_{self.renderedMousebiteCounter}_{i+1}")
+                                    ref=f"KiKit_MB_{self.renderedMousebiteCounter}_{i+1}",
+                                    excludedFromPos=True)
 
-    def makeCutsToLayer(self, cuts, layer=Layer.Cmts_User, prolongation=fromMm(0)):
+    def makeCutsToLayer(self, cuts, layer=Layer.Cmts_User, prolongation=fromMm(0), width=fromMm(0.3)):
         """
         Take a list of cuts and render them as lines on given layer. The cuts
         can be prolonged just like with mousebites.
@@ -1499,11 +1573,14 @@ class Panel:
                 segment.SetLayer(layer)
                 segment.SetStart(toKiCADPoint(a))
                 segment.SetEnd(toKiCADPoint(b))
-                segment.SetWidth(fromMm(0.3))
+                segment.SetWidth(width)
                 self.board.Add(segment)
 
     def addNPTHole(self, position: VECTOR2I, diameter: KiLength,
-                   paste: bool=False, ref: Optional[str]=None) -> None:
+                   paste: bool=False, ref: Optional[str]=None,
+                   excludedFromPos: bool=False,
+                   solderMaskMargin: Optional[KiLength] = None,
+    ) -> None:
         """
         Add a drilled non-plated hole to the position (`VECTOR2I`) with given
         diameter. The paste option allows to place the hole on the paste layers.
@@ -1513,6 +1590,8 @@ class Panel:
         for pad in footprint.Pads():
             pad.SetDrillSize(toKiCADPoint((diameter, diameter)))
             pad.SetSize(toKiCADPoint((diameter, diameter)))
+            if solderMaskMargin is not None:
+                footprint.SetLocalSolderMaskMargin(solderMaskMargin)
             if paste:
                 layerSet = pad.GetLayerSet()
                 layerSet.AddLayer(Layer.F_Paste)
@@ -1520,6 +1599,10 @@ class Panel:
                 pad.SetLayerSet(layerSet)
         if ref is not None:
             footprint.SetReference(ref)
+        if hasattr(footprint, "SetExcludedFromPosFiles"): # KiCAD 6 doesn't support this attribute
+            footprint.SetExcludedFromPosFiles(excludedFromPos)
+        if hasattr(footprint, "SetBoardOnly"):
+            footprint.SetBoardOnly(True)
         self.board.Add(footprint)
 
     def addFiducial(self, position: VECTOR2I, copperDiameter: KiLength,
@@ -1537,7 +1620,6 @@ class Panel:
         # then we can change its properties. Otherwise, it misses parent pointer
         # and KiCAD crashes.
         self.board.Add(footprint)
-        footprint.SetPosition(position)
         if ref is not None:
             footprint.SetReference(ref)
         for pad in footprint.Pads():
@@ -1548,6 +1630,17 @@ class Panel:
                 layerSet = pad.GetLayerSet()
                 layerSet.AddLayer(Layer.F_Paste)
                 pad.SetLayerSet(layerSet)
+
+        for drawing in footprint.GraphicalItems():
+            if drawing.GetShape() != pcbnew.SHAPE_T_CIRCLE:
+                continue
+            if drawing.GetLayer() == Layer.F_Fab:
+                drawing.SetEnd(toKiCADPoint((openingDiameter / 2, 0)))
+            if drawing.GetLayer() == Layer.F_CrtYd:
+                drawing.SetEnd(toKiCADPoint((openingDiameter / 2 + fromMm(0.1), 0)))
+
+        footprint.SetPosition(position)
+
         if bottom:
             footprint.Flip(position, False)
 
@@ -1581,16 +1674,19 @@ class Panel:
                              paste, ref = f"KiKit_FID_B_{i+1}")
 
     def addCornerTooling(self, holeCount, horizontalOffset, verticalOffset,
-                         diameter, paste=False):
+                         diameter, paste=False, solderMaskMargin: Optional[KiLength]=None):
         """
         Add up to 4 tooling holes to the top-left, top-right, bottom-left and
         bottom-right corner of the board (in this order). This function expects
         there is enough space on the board/frame/rail to place the feature.
 
         The offsets are measured from the outer edges of the substrate.
+
+        Optionally, a solder mask margin (diameter) can also be specified.
         """
         for i, pos in enumerate(self.panelCorners(horizontalOffset, verticalOffset)[:holeCount]):
-            self.addNPTHole(pos, diameter, paste, ref=f"KiKit_TO_{i+1}")
+            self.addNPTHole(pos, diameter, paste, ref=f"KiKit_TO_{i+1}", excludedFromPos=False,
+                            solderMaskMargin=solderMaskMargin)
 
     def addMillFillets(self, millRadius):
         """
@@ -1629,7 +1725,7 @@ class Panel:
         """
         tabs, cuts = [], []
         for s in self.substrates:
-            t, c = buildTabs(s, s.partitionLine, s.annotations, fillet)
+            t, c = buildTabs(self, s, s.partitionLine, s.annotations, fillet)
             tabs.extend(t)
             cuts.extend(c)
         self.boardSubstrate.union(tabs)
@@ -1804,6 +1900,10 @@ class Panel:
 
         return cuts
 
+    def inheritLayerNames(self, board):
+        for layer in pcbnew.LSET.AllLayersMask().Seq():
+            name = board.GetLayerName(layer)
+            self.board.SetLayerName(layer, name)
 
     def inheritCopperLayers(self, board):
         """
@@ -1838,10 +1938,11 @@ class Panel:
         By default, fills top and bottom layer, but you can specify any other
         copper layer that is enabled.
         """
+        _, _, maxx, maxy = self.panelBBox()
         if not self.boardSubstrate.isSinglePiece():
-            raise RuntimeError("The substrate has to be a single piece to fill unused areas")
-        if not len(layers)>0:
-            raise RuntimeError("No layers to add copper to")
+            self.reportError(toKiCADPoint((maxx, maxy)), "The substrate has to be a single piece to fill unused areas")
+        if len(layers) == 0:
+            self.reportError(toKiCADPoint((maxx, maxy)), "No layers to add copper to")
         increaseZonePriorities(self.board)
 
         zoneArea = self.boardSubstrate.exterior()
@@ -2183,6 +2284,8 @@ class Panel:
             c += vec[1]
         self.setAuxiliaryOrigin(self.getAuxiliaryOrigin() + vec)
         self.setGridOrigin(self.getGridOrigin() + vec)
+        for error in self.errors:
+            error = (error[0] + vec, error[1])
         for drcE in self.drcExclusions:
             drcE.position += vec
 
@@ -2242,7 +2345,10 @@ def extractSourceAreaByAnnotation(board, reference):
     `kikit:Board`, extract the source area. The source area is a bounding box of
     continuous lines in the Edge.Cuts on which the arrow in reference point.
     """
-    annotation = getFootprintByReference(board, reference)
+    try:
+        annotation = getFootprintByReference(board, reference)
+    except Exception:
+        raise RuntimeError(f"Cannot extract board - boards is specified via footprint with reference '{reference}' which was not found")
     tip = annotation.GetPosition()
     edges = collectEdges(board, Layer.Edge_Cuts)
     # KiCAD 6 will need an adjustment - method Collide was introduced with

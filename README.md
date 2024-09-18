@@ -33,17 +33,13 @@ PS: Be sure to check out my other KiCAD & PCB related projects:
 
 ## Installation
 
-KiKit is available as a [PyPi package](https://pypi.org/project/KiKit/),
-therefore, you can install it via pip:
+KiKit is available as a [PyPi package](https://pypi.org/project/KiKit/).
+However, due to packaging of KiCAD, installation on some platforms requires
+usage of specific Python interpreter.
 
-```
-pip3 install kikit
-```
-
-Then you can install the Pcbnew action plugins via KiCAD's PCM.
-
-For more detailed instructions with steps to enable GUI plugins, please see the
-[installation guide](https://yaqwsx.github.io/KiKit/latest/installation/intro/).
+Please follow the detailed [installation
+guide](https://yaqwsx.github.io/KiKit/latest/installation/intro/) that covers
+installation based on the platform you use.
 
 ## Why Should I Use It?
 
@@ -79,11 +75,14 @@ manufacturing data and board presentation pages.
 
 ## How To Use It?
 
-Read the [CLI documentation](https://yaqwsx.github.io/KiKit/latest/panelization/cli/) and the [panelize
-documentation](doc/panelization.md). Also don't miss the
-[examples](https://yaqwsx.github.io/KiKit/examples/panelization/examples/). There is also a quick not on how to use
-[panelization action plugin](https://yaqwsx.github.io/KiKit/latest/panelization/gui/). If you are interested in
-generating solder paste stencils, see [Stencil documentation](https://yaqwsx.github.io/KiKit/latest/stencil/)
+Start with reading the [panelization
+documentation](https://yaqwsx.github.io/KiKit/latest/panelization/intro/). This
+page will you guide through CLI, GUI and scripting usage. Also don't miss the
+[examples](https://yaqwsx.github.io/KiKit/latest/panelization/examples/).
+There is also a quick not on how to use [panelization action
+plugin](https://yaqwsx.github.io/KiKit/latest/panelization/gui/). If you are
+interested in generating solder paste stencils, see [Stencil
+documentation](https://yaqwsx.github.io/KiKit/latest/stencil/)
 
 ## Acknowledgements
 

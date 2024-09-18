@@ -11,6 +11,7 @@ import numpy as np
 from shapely.geometry import (
     Polygon,
     MultiPolygon)
+from shapely.ops import unary_union
 
 class KiCADCopperFillMixin(PanelFeature):
     """
@@ -23,22 +24,21 @@ class KiCADCopperFillMixin(PanelFeature):
         pass  # solid infill does nothing
 
     def apply(self, panel: Any) -> None:
-        if not panel.boardSubstrate.isSinglePiece():
-            raise RuntimeError(
-                "The substrate has to be a single piece to fill unused areas"
-            )
         if not len(self.layers) > 0:
             raise RuntimeError("No layers to add copper to")
         increaseZonePriorities(panel.board)
 
         zoneArea = panel.boardSubstrate.substrates.buffer(-self.edgeclearance)
-        zoneArea = zoneArea.difference(MultiPolygon(
+        zoneArea = zoneArea.difference(unary_union(
             [substrate.exterior().buffer(self.clearance) for substrate in panel.substrates]
         ))
 
         geoms = [zoneArea] if isinstance(zoneArea, Polygon) else zoneArea.geoms
 
         for g in geoms:
+            if len(g.exterior.coords) == 0:
+                # Skip empty geometries
+                continue
             zoneContainer = pcbnew.ZONE(panel.board)
             self._adjustZoneParameters(zoneContainer)
             zoneContainer.Outline().AddOutline(linestringToKicad(g.exterior))
@@ -94,9 +94,9 @@ class HexCopperFill(PanelFeature):
     clearance: KiLength = field(default_factory=lambda: fromMm(1))
     edgeclearance: KiLength = field(default_factory=lambda: fromMm(1))
     layers: List[Layer] = field(default_factory=lambda: [Layer.F_Cu, Layer.B_Cu])
-    diameter: KiLength = field(default_factory=lambda: fromMm(5))
+    diameter: KiLength = field(default_factory=lambda: fromMm(7))
     space: KiLength = field(default_factory=lambda: fromMm(0.5))
-    threshold: float = field(default_factory=lambda: 0.15)
+    threshold: float = field(default_factory=lambda: 0.25)
 
     def _buildHexagonsPolygon(self, area: Tuple[float, float, float, float]) -> MultiPolygon:
         horizontalSpacing = self.space + np.sqrt(3) / 2 * self.diameter
@@ -124,10 +124,6 @@ class HexCopperFill(PanelFeature):
         return MultiPolygon(hexagons)
 
     def apply(self, panel: Panel) -> None:
-        if not panel.boardSubstrate.isSinglePiece():
-            raise RuntimeError(
-                "The substrate has to be a single piece to fill unused areas"
-            )
         if not len(self.layers) > 0:
             raise RuntimeError("No layers to add copper to")
 
@@ -135,7 +131,7 @@ class HexCopperFill(PanelFeature):
 
         zoneArea = panel.boardSubstrate.substrates.buffer(-self.edgeclearance)
         zoneArea = zoneArea.intersection(panel.boardSubstrate.substrates)
-        zoneArea = zoneArea.difference(MultiPolygon(
+        zoneArea = zoneArea.difference(unary_union(
             [substrate.exterior().buffer(self.clearance) for substrate in panel.substrates]
         ))
 

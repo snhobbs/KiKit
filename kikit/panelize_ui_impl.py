@@ -187,6 +187,8 @@ def readSourceArea(specification, board):
             return expandRect(findBoardBoundingBox(board), tolerance)
         if type == "annotation":
             ref = specification["ref"]
+            if ref.strip() == "":
+                raise PresetError("When using source 'annotation' reference cannot be empty.")
             return expandRect(extractSourceAreaByAnnotation(board, ref), tolerance)
         if type == "rectangle":
             tl = VECTOR2I(specification["tlx"], specification["tly"])
@@ -367,14 +369,22 @@ def makeCuts(properties, panel, cuts, ignoreOffset):
             return
         if type == "vcuts":
             panel.makeVCuts(cuts, properties["cutcurves"], offset)
-            panel.setVCutLayer(properties["layer"])
-            panel.setVCutClearance(properties["clearance"])
+            panel.vCutSettings.layer = properties["layer"]
+            panel.vCutSettings.clearance = properties["clearance"]
+            panel.vCutSettings.lineWidth = properties["linewidth"]
+            panel.vCutSettings.textThickness = properties["textthickness"]
+            panel.vCutSettings.textProlongation = properties["textprolongation"]
+            panel.vCutSettings.endProlongation = properties["endprolongation"]
+            panel.vCutSettings.textTemplate = properties["template"]
+            panel.vCutSettings.textOffset = properties["textoffset"]
+
         elif type == "mousebites":
             panel.makeMouseBites(cuts, properties["drill"],
                 properties["spacing"], offset, properties["prolong"])
         elif type == "layer":
             panel.makeCutsToLayer(cuts,
-                layer=properties["layer"], prolongation=properties["prolong"])
+                layer=properties["layer"], prolongation=properties["prolong"],
+                width=properties["linewidth"])
         else:
             raise PresetError(f"Unknown type '{type}' of cuts specification.")
     except KeyError as e:
@@ -501,11 +511,12 @@ def buildTooling(preset, panel):
         hoffset, voffset = toolingPreset["hoffset"], toolingPreset["voffset"]
         diameter = toolingPreset["size"]
         paste = toolingPreset["paste"]
+        soldermaskmargin = toolingPreset["soldermaskmargin"]
         if type == "3hole":
-            panel.addCornerTooling(3, hoffset, voffset, diameter, paste)
+            panel.addCornerTooling(3, hoffset, voffset, diameter, paste, soldermaskmargin)
             return
         if type == "4hole":
-            panel.addCornerTooling(4, hoffset, voffset, diameter, paste)
+            panel.addCornerTooling(4, hoffset, voffset, diameter, paste, soldermaskmargin)
             return
         raise PresetError(f"Unknown type '{type}' of tooling specification.")
     except KeyError as e:

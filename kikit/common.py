@@ -1,9 +1,10 @@
 from __future__ import annotations
 import sys
+import traceback
 from typing import List, Optional, Tuple, Union, Callable
 from kikit.defs import Layer
 from kikit.typing import Box
-from pcbnewTransition import pcbnew, isV7
+from pcbnewTransition import pcbnew, isV7, isV8
 from kikit.intervals import AxialLine
 from pcbnewTransition.pcbnew import BOX2I, VECTOR2I, EDA_ANGLE
 import os
@@ -43,7 +44,7 @@ def fitsIn(what: Union[BOX2I, VECTOR2I], where: BOX2I) -> bool:
     Return true iff 'what' (BOX2I or VECTOR2I) is fully contained in 'where'
     (BOX2I)
     """
-    if isV7():
+    if isV7() or isV8():
         assert isinstance(what, (BOX2I, VECTOR2I, pcbnew.wxPoint))
     else:
         assert isinstance(what, (BOX2I, VECTOR2I, pcbnew.wxPoint, pcbnew.EDA_RECT))
@@ -259,6 +260,18 @@ def isLinestringCyclic(line):
     c = line.coords
     return c[0] == c[-1] or isinstance(line, LinearRing)
 
+def constructArrow(origin, direction, distance: float, tipSize: float) -> shapely.LineString:
+    origin = np.array(origin)
+    direction = np.array(direction)
+
+    endpoint = origin + direction * distance
+
+    tipEndpoint1 = endpoint + tipSize / 2 * (-direction - np.array([-direction[1], direction[0]]))
+    tipEndpoint2 = endpoint + tipSize / 2 * (-direction + np.array([-direction[1], direction[0]]))
+
+    arrow = shapely.LineString([origin, endpoint, tipEndpoint1, tipEndpoint2, endpoint])
+    return arrow
+
 def fromOpt(object, default):
     """
     Given an object, return it if not None. Otherwise return default
@@ -269,7 +282,7 @@ def isBottomLayer(layer):
     """
     Decide if layer is a bottom layer
     """
-    return str(layer).startswith("Layer.B_")
+    return layer.name.startswith("B_")
 
 def commonPoints(lines):
     """
@@ -376,6 +389,9 @@ def fakeKiCADGui():
     import wx
     import os
 
+    if hasattr(wx, "DisableAsserts"):
+        wx.DisableAsserts()
+
     if os.name != "nt" and os.environ.get("DISPLAY", "").strip() == "":
         return None
 
@@ -396,3 +412,19 @@ def fakeKiCADGui():
     os.dup2(os.open(os.devnull,os.O_RDWR), 2)
 
     return None
+
+def execute_with_debug(procedure, kwargs):
+    debug = kwargs["debug"]
+    del kwargs["debug"]
+
+    if debug:
+        traceback.print_exc(file=sys.stderr)
+
+    try:
+        return procedure(**kwargs)
+    except Exception as e:
+        sys.stderr.write(f"An error occurred: {e}\n")
+        sys.stderr.write("No output files produced\n")
+        if debug:
+            raise e from None
+        sys.exit(1)
