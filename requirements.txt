@@ -1,0 +1,9 @@
+numpy # Required for MacOS
+pcbnewTransition >= 0.4.1, <=0.5
+shapely>=2.0.3
+click>=7.1
+markdown2>=2.4
+pybars3>=0.9
+solidpython>=1.1.2
+commentjson>=0.9
+
