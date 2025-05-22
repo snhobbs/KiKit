@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name="KiKit"
-version="1.0.1"
+version="1.7.2"
 dynamic = ["dependencies"]
 authors=[
     {name="Jan Mrázek", email="email@honzamrazek.cz"}]
