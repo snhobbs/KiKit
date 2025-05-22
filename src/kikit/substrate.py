@@ -7,7 +7,7 @@ import shapely
 import json
 import numpy as np
 from kikit.intervals import Interval, BoxNeighbors, BoxPartitionLines
-from pcbnewTransition import pcbnew
+from pcbnewTransition import pcbnew, kicad_major
 from enum import IntEnum
 from itertools import product
 
@@ -51,6 +51,10 @@ def getStartPoint(geom):
         point = geom.GetStart() + pcbnew.VECTOR2I(geom.GetRadius(), 0)
     elif geom.GetShape() == STROKE_T.S_RECT:
         point = geom.GetStart()
+    elif geom.GetShape() == STROKE_T.S_POLYGON:
+        # Polygons don't use the properties for start point, look into the
+        # geometry
+        point = geom.GetPolyShape().Outline(0).CPoints()[0]
     else:
         point = geom.GetStart()
     return point
@@ -62,6 +66,14 @@ def getEndPoint(geom):
     elif geom.GetShape() == STROKE_T.S_RECT:
         # Rectangle is closed, so it starts at the same point as it ends
         point = geom.GetStart()
+    elif geom.GetShape() == STROKE_T.S_POLYGON:
+        # Polygons don't use the properties for start point, look into the
+        # geometry
+        outline = geom.GetPolyShape().Outline(0)
+        if outline.IsClosed():
+            point = outline.CPoints()[0]
+        else:
+            point = outline.CPoints()[-1]
     else:
         point = geom.GetStart() if geom.IsClosed() else geom.GetEnd()
     return point
@@ -776,7 +788,7 @@ class Substrate:
         circle.SetShape(STROKE_T.S_CIRCLE)
         circle.SetLayer(Layer.Edge_Cuts)
         circle.SetCenter(toKiCADPoint(c))
-        if isV8():
+        if kicad_major() >= 8:
             circle.SetRadius(int(r))
         else:
             circle.SetEnd(toKiCADPoint(c + np.array([r, 0])))

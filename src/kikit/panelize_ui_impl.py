@@ -246,14 +246,16 @@ def buildLayout(preset, panel, sourceBoard, sourceArea):
         if type == "grid":
             placementClass = getPlacementClass(layout["alternation"])
             placer = placementClass(
-                verSpace=layout["vspace"],
                 horSpace=layout["hspace"],
+                verSpace=layout["vspace"],
                 hbonewidth=layout["hbackbone"],
                 vbonewidth=layout["vbackbone"],
                 hboneskip=layout["hboneskip"],
                 vboneskip=layout["vboneskip"],
                 hbonefirst=layout["hbonefirst"],
-                vbonefirst=layout["vbonefirst"])
+                vbonefirst=layout["vbonefirst"],
+                hevendiff=layout["hevendiff"],
+                vevendiff=layout["vevendiff"])
             substrates = panel.makeGrid(
                 boardfile=sourceBoard, sourceArea=sourceArea,
                 rows=layout["rows"], cols=layout["cols"], destination=VECTOR2I(0, 0),
@@ -469,7 +471,7 @@ def buildFraming(preset, panel):
             addFilletAndChamfer(framingPreset, panel)
             return []
         if type == "frame":
-            cuts = panel.makeFrame(framingPreset["width"],
+            cuts = panel.makeFrame(framingPreset["width"], framingPreset["width"],
                 framingPreset["hspace"], framingPreset["vspace"],
                 framingPreset["mintotalwidth"], framingPreset["mintotalheight"],
                 framingPreset["maxtotalwidth"], framingPreset["maxtotalheight"])
@@ -482,10 +484,11 @@ def buildFraming(preset, panel):
                 return cuts[1]
             return []
         if type == "tightframe":
-            panel.makeTightFrame(framingPreset["width"], framingPreset["slotwidth"],
-                framingPreset["hspace"], framingPreset["vspace"],
-                framingPreset["mintotalwidth"], framingPreset["mintotalheight"],
-                framingPreset["maxtotalwidth"], framingPreset["maxtotalheight"])
+            panel.makeTightFrame(framingPreset["width"], framingPreset["width"],
+                framingPreset["slotwidth"],  framingPreset["hspace"],
+                framingPreset["vspace"], framingPreset["mintotalwidth"],
+                framingPreset["mintotalheight"], framingPreset["maxtotalwidth"],
+                framingPreset["maxtotalheight"])
             panel.boardSubstrate.removeIslands()
             addFilletAndChamfer(framingPreset, panel)
             return []

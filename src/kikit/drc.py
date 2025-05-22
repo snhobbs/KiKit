@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, TextIO, Tuple, Union
 from pathlib import Path
 
-from pcbnewTransition import isV7, isV8, pcbnew
+from pcbnewTransition import isV7, isV8, isV9, pcbnew
 
 from kikit.common import fromMm, toMm
 from kikit.drc_ui import ReportLevel
@@ -20,7 +20,10 @@ def roundCoord(x: int) -> int:
     # emulate that
     return round(x - 50, -4)
 
-def getItemDescription(item: pcbnew.BOARD_ITEM, units: pcbnew.EDA_UNITS = pcbnew.EDA_UNITS_MILLIMETRES):
+def getItemDescription(item: pcbnew.BOARD_ITEM, units: pcbnew.EDA_UNITS = pcbnew.EDA_UNITS_MM):
+    if isV9():
+        uProvider = pcbnew.UNITS_PROVIDER(pcbnew.pcbIUScale, units)
+        return item.GetItemDescription(uProvider, True)
     if isV7() or isV8():
         uProvider = pcbnew.UNITS_PROVIDER(pcbnew.pcbIUScale, units)
         return item.GetItemDescription(uProvider)
@@ -61,6 +64,8 @@ class DrcExclusion:
     objects: List[pcbnew.BOARD_ITEM] = field(default_factory=list)
 
     def eqRepr(self) -> Tuple[str, Union[Tuple[str, str], str]]:
+        if len(self.objects) == 0:
+            return (self.type, ())
         if len(self.objects) == 1:
             objRepr = str(self.objects[0].m_Uuid.AsString()) if isinstance(self.objects[0], pcbnew.BOARD_ITEM) else self.objects[0]
             return (self.type, objRepr)
@@ -84,9 +89,9 @@ class Violation:
     def _formatObject(self, obj: pcbnew.BOARD_ITEM, units: Any) -> str:
         p = obj.GetPosition()
         pos = "unknown"
-        if units == pcbnew.EDA_UNITS_MILLIMETRES:
+        if units == pcbnew.EDA_UNITS_MM:
             pos = f"{toMm(p[0]):.4f} mm, {toMm(p[1]):.4f} mm"
-        if units == pcbnew.EDA_UNITS_INCHES:
+        if units == pcbnew.EDA_UNITS_INCH:
             pos = f"{pcbnew.ToMils(p[0]):.1f} mil, {pcbnew.ToMils(p[1]):.1f} mil"
         return f"@({pos}): {getItemDescription(obj, units)}"
 
@@ -195,7 +200,7 @@ def runBoardDrc(board: pcbnew.BOARD, strict: bool) -> DrcReport:
         try:
             tmpFile.close()
             result = pcbnew.WriteDRCReport(board, tmpFile.name,
-                                           pcbnew.EDA_UNITS_MILLIMETRES, strict)
+                                           pcbnew.EDA_UNITS_MM, strict)
             if not result:
                 raise RuntimeError("Cannot run DRC: Unspecified KiCAD error")
             with open(tmpFile.name, encoding="utf-8") as f:
@@ -234,6 +239,8 @@ def readBoardDrcExclusions(board: pcbnew.BOARD) -> List[DrcExclusion]:
         exclusions = project["board"]["design_settings"]["drc_exclusions"]
     except KeyError:
         return [] # There are no exclusions
+    if isV9() and len(exclusions) > 0 and isinstance(exclusions[0], list):
+        exclusions = [x[0] for x in exclusions]
     return [deserializeExclusion(e, board) for e in exclusions]
 
 def runImpl(board, useMm, ignoreExcluded, strict, level, yieldViolation):
@@ -241,7 +248,7 @@ def runImpl(board, useMm, ignoreExcluded, strict, level, yieldViolation):
     import sys
     faulthandler.enable(sys.stderr)
 
-    units = pcbnew.EDA_UNITS_MILLIMETRES if useMm else EDA_UNITS_INCHES
+    units = pcbnew.EDA_UNITS_MM if useMm else pcbnew.EDA_UNITS_INCH
     report = runBoardDrc(board, strict)
     if ignoreExcluded:
         report.pruneExclusions(readBoardDrcExclusions(board))

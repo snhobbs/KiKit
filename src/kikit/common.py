@@ -4,7 +4,7 @@ import traceback
 from typing import List, Optional, Tuple, Union, Callable
 from kikit.defs import Layer
 from kikit.typing import Box
-from pcbnewTransition import pcbnew, isV7, isV8
+from pcbnewTransition import pcbnew, kicad_major
 from kikit.intervals import AxialLine
 from pcbnewTransition.pcbnew import BOX2I, VECTOR2I, EDA_ANGLE
 import os
@@ -44,7 +44,7 @@ def fitsIn(what: Union[BOX2I, VECTOR2I], where: BOX2I) -> bool:
     Return true iff 'what' (BOX2I or VECTOR2I) is fully contained in 'where'
     (BOX2I)
     """
-    if isV7() or isV8():
+    if kicad_major() >= 7:
         assert isinstance(what, (BOX2I, VECTOR2I, pcbnew.wxPoint))
     else:
         assert isinstance(what, (BOX2I, VECTOR2I, pcbnew.wxPoint, pcbnew.EDA_RECT))
@@ -74,6 +74,8 @@ def collectEdges(board, layerId, sourceArea=None):
         if edge.GetLayer() != layerId:
             continue
         if isinstance(edge, pcbnew.PCB_DIMENSION_BASE):
+            continue
+        if isinstance(edge, pcbnew.PCB_TEXT):
             continue
         if not sourceArea or fitsIn(edge.GetBoundingBox(), sourceArea):
             edges.append(edge)
@@ -313,7 +315,7 @@ def resolveAnchor(anchor):
     a VECTOR2I
     """
     choices = {
-        "tl": lambda x: x.GetPosition(),
+        "tl": lambda x: x.GetPosition() + toKiCADPoint((0, 0)),
         "tr": lambda x: x.GetPosition() + toKiCADPoint((x.GetWidth(), 0)),
         "bl": lambda x: x.GetPosition() + toKiCADPoint((0, x.GetHeight())),
         "br": lambda x: x.GetPosition() + toKiCADPoint((x.GetWidth(), x.GetHeight())),
